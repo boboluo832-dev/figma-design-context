@@ -1,0 +1,10 @@
+.legna/
+.claude/*
+!.claude/settings.json
+.figma-temp/
+node_modules/
+dist/
+*.html
+.env*
+!.env.test.example
+*.log

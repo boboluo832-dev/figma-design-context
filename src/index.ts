@@ -1,8 +1,18 @@
 #!/usr/bin/env node
+/**
+ * MCP Server 入口文件
+ *
+ * 职责：
+ * 1. 初始化所有核心服务实例（FigmaClient、TempManager、Logger、SvgExporter）
+ * 2. 注册 14 个 MCP 工具（tool），每个工具对应一种 Figma 数据获取/转换能力
+ * 3. 通过 stdio 传输层与 MCP Client（如 Claude Desktop）建立通信
+ *
+ * 数据流：Client 调用 tool → handler 执行 → FigmaClient 请求 API → transformer 转换格式 → 返回文本结果
+ */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { z } from "zod"; // 参数校验库，MCP SDK 要求用 zod 定义 tool 的输入 schema
 import { FigmaClient } from "./figma-client.js";
 import type { FigmaNodesResponse, FigmaVersionsResponse } from "./figma-client.js";
 import { TempManager } from "./temp-manager.js";
@@ -13,6 +23,7 @@ import { parseFigmaUrl, extractAllTexts, formatVariableValues, formatValue, extr
 import { diffNodes, formatDiffOutput } from "./diff.js";
 import { textResponse, normalizeNodeId, formatError, fetchNodeDocument, isErrorResponse, exportAndRegisterIcons } from "./tools/shared.js";
 
+// 启动前置检查：必须提供 Figma API Token
 if (!process.env.FIGMA_TOKEN) {
   process.stderr.write(
     "Error: FIGMA_TOKEN 环境变量未设置。\n" +
@@ -22,6 +33,11 @@ if (!process.env.FIGMA_TOKEN) {
   process.exit(1);
 }
 
+/**
+ * 将变量数据转换为 condensed 格式的变量映射
+ * 输入：{ variableId: { cssVar: "--color-primary" } }
+ * 输出：{ variableId: "--color-primary" } （扁平化，只保留 CSS 变量名）
+ */
 function toCondensedVariableMap(
   variables: Record<string, { cssVar: string }> | null | undefined
 ): CondensedVariableMap | null {
@@ -35,6 +51,11 @@ function toCondensedVariableMap(
   return Object.keys(result).length > 0 ? result : null;
 }
 
+/**
+ * 加载文件的语义变量定义（Design Tokens）
+ * 调用 Figma Variables API，构建变量定义和映射
+ * 如果 API 不可用（如免费版账号），优雅降级返回空值
+ */
 async function loadSemanticVariables(fileKey: string): Promise<{
   definitions: ReturnType<typeof buildSemanticVariableDefinitions> | null;
   variableMap: CondensedVariableMap | null;
@@ -65,26 +86,41 @@ async function loadSemanticVariables(fileKey: string): Promise<{
   }
 }
 
+// 从 package.json 读取版本号，避免手动同步
 import { createRequire } from "node:module";
 const __require = createRequire(import.meta.url);
 const __pkg = __require("../package.json");
 
+// 创建 MCP Server 实例，name 和 version 会在 Client 的 tools/list 中展示
 const server = new McpServer({
   name: "figma-design-context",
   version: __pkg.version,
 });
 
-const tempManager = new TempManager();
-tempManager.init();
+// 初始化核心服务
+const tempManager = new TempManager(); // 临时文件管理（.figma-temp/ 目录）
+tempManager.init(); // 清理旧数据，创建目录结构
 
-const logger = new Logger(tempManager);
-const figma = new FigmaClient(process.env.FIGMA_TOKEN);
-const svgExporter = new SvgExporter(figma, tempManager);
+const logger = new Logger(tempManager); // 结构化日志（仅 debug 模式写入）
+const figma = new FigmaClient(process.env.FIGMA_TOKEN); // Figma REST 客户端（带缓存/重试/并发控制）
+const svgExporter = new SvgExporter(figma, tempManager); // SVG 导出器（图标检测 + 下载）
 
+// 注册 API 响应回调，用于 debug 模式下记录原始响应
 figma.onResponse = (path, params, data) => {
   logger.logRaw("api", { path, params }, data);
 };
 
+// ==================== 工具注册 ====================
+// 每个 registerTool 调用注册一个 MCP tool，包含：
+// - 工具名称（Client 通过此名称调用）
+// - description + inputSchema（Client 展示给 LLM 用于决策）
+// - handler 函数（实际执行逻辑）
+
+/**
+ * 工具 1: get_file_structure
+ * 获取文件的页面和顶层 frame 列表，用于了解文件整体结构
+ * 只请求 depth=2，避免拉取整棵树
+ */
 server.registerTool(
   "get_file_structure",
   {
@@ -117,6 +153,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 2: get_texts
+ * 递归提取节点树中所有 TEXT 节点的文字内容和样式信息
+ * 支持直接传入 Figma URL 自动解析 fileKey 和 nodeId
+ */
 server.registerTool(
   "get_texts",
   {
@@ -173,6 +214,15 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 3: get_node（核心工具）
+ * 获取指定节点的 AI 友好数据，支持 5 种输出格式：
+ * - condensed-v3（默认）：最适合 AI 代码生成，带语义分区和 token 去重
+ * - semantic-json：结构化语义 JSON，适合程序化消费
+ * - condensed-v2：去重文本格式（兼容版）
+ * - condensed：旧版内联文本格式
+ * - json：完整数据，用于排障
+ */
 server.registerTool(
   "get_node",
   {
@@ -293,6 +343,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 4: search_nodes
+ * 按名称/类型搜索节点，支持限定搜索范围到某个父节点下
+ * 返回匹配节点的 ID、名称、类型和路径，方便后续用 get_node 获取详情
+ */
 server.registerTool(
   "search_nodes",
   {
@@ -338,6 +393,10 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 5: get_components
+ * 获取文件中所有组件的列表，返回组件名称、ID、描述等基本信息
+ */
 server.registerTool(
   "get_components",
   {
@@ -357,6 +416,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 6: get_component_variants
+ * 获取 COMPONENT_SET 下所有 variant 及其属性组合
+ * 对生成组件 Props TypeScript 接口非常有帮助
+ */
 server.registerTool(
   "get_component_variants",
   {
@@ -415,6 +479,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 7: get_variables
+ * 获取文件的 Design Variables（设计变量/token），包含颜色、数值等
+ * 需要 Figma 企业版或专业版才能访问 Variables API
+ */
 server.registerTool(
   "get_variables",
   {
@@ -448,6 +517,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 8: get_styles
+ * 获取文件中所有已发布的样式定义（颜色、文字、效果、网格）
+ * 帮助 AI 理解设计系统，生成一致的代码
+ */
 server.registerTool(
   "get_styles",
   {
@@ -514,6 +588,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 9: get_node_css
+ * 将节点转换为 CSS 或 Tailwind 类名
+ * recursive=true 时递归生成整个组件树的样式代码
+ */
 server.registerTool(
   "get_node_css",
   {
@@ -546,6 +625,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 10: get_images
+ * 获取指定节点的图片导出 URL（PNG/SVG/PDF/JPG）
+ * 返回 Figma CDN 上的临时 URL，有效期约 14 天
+ */
 server.registerTool(
   "get_images",
   {
@@ -568,6 +652,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 11: export_svg
+ * 导出指定节点为 SVG 格式，下载内容并保存到临时目录
+ * 同时注册到 icons index，供后续 get_icons_index 查询
+ */
 server.registerTool(
   "export_svg",
   {
@@ -610,6 +699,10 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 12: get_versions
+ * 获取文件的版本历史列表，用于了解设计迭代过程
+ */
 server.registerTool(
   "get_versions",
   {
@@ -632,6 +725,12 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 13: diff_nodes
+ * 对比两个节点的差异，支持两种模式：
+ * - snapshot：与历史版本对比（通过 Figma 版本 API）
+ * - nodes：两个不同节点直接对比
+ */
 server.registerTool(
   "diff_nodes",
   {
@@ -718,6 +817,11 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 14: get_icons_index
+ * 获取当前会话中已导出的所有图标/SVG 的汇总索引
+ * 这是一个会话级累积的工具，每次 export_svg 或 get_node 导出图标后自动更新
+ */
 server.registerTool(
   "get_icons_index",
   {
@@ -732,6 +836,12 @@ server.registerTool(
   }
 );
 
+/**
+ * 工具 15: get_page_for_codegen
+ * 一站式获取代码生成所需的完整上下文：
+ * 压缩格式结构 + design tokens + 组件定义 + 颜色/字体规范 + SVG 图标
+ * 减少 LLM 多轮调用，一次拿全所有信息
+ */
 server.registerTool(
   "get_page_for_codegen",
   {
@@ -829,5 +939,8 @@ server.registerTool(
   }
 );
 
+// ==================== 启动 MCP 服务 ====================
+// 使用 stdio 传输层：通过 stdin/stdout 与 MCP Client 通信
+// Client（如 Claude Desktop）spawn 本进程后，通过管道交换 JSON-RPC 消息
 const transport = new StdioServerTransport();
 await server.connect(transport);

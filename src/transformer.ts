@@ -1,3 +1,23 @@
+/**
+ * Figma 数据转换器
+ *
+ * 核心模块，负责将 Figma API 返回的原始节点树转换为多种精简格式：
+ *
+ * 输出格式（从简到详）：
+ * - simplified: 简化节点树（保留关键属性，去除冗余）
+ * - condensed v1: 缩进文本格式（最紧凑，适合 token 受限场景）
+ * - condensed v2: 带更多样式细节的文本格式
+ * - condensed v3: 最完整的文本格式（含变量定义、SVG 引用）
+ * - semantic JSON: 结构化 JSON（含语义角色、HTML 标签推断）
+ *
+ * 关键能力：
+ * - 语义角色推断（inferSemanticRole）：根据节点属性推断 HTML 标签
+ * - 变量绑定解析（buildVariableMap）：将 Figma 变量 ID 映射为 CSS 变量名
+ * - 布局推断（inferLayout）：从子节点位置推断 flex/grid 布局
+ * - CSS 生成：颜色、渐变、阴影、填充等转为 CSS 值
+ * - Token 预算控制（withBudget）：按字符数限制输出长度
+ */
+
 export interface FigmaColor {
   r: number;
   g: number;
@@ -164,6 +184,7 @@ interface NamePattern {
   html: string;
 }
 
+/** 跳过的节点类型（布尔运算、切片、矢量图形等不参与布局的类型） */
 const SKIP_TYPES = new Set(["BOOLEAN_OPERATION", "SLICE", "VECTOR", "STAR", "LINE", "REGULAR_POLYGON"]);
 const ICON_CONTAINER_TYPES = new Set(["FRAME", "COMPONENT", "INSTANCE"]);
 const ICON_NAME_PATTERN = /^(icon.*|ico(\b|[\/_\-\s]|$)|icons?(\b|[\/_\-\s]|$)|basics(\b|[\/_\-\s]|$)|module(\b|[\/_\-\s]|$)|(arrow|chevron|caret)(\b|[\/_\-\s]|$)|(edit|calendar|time|user|help|error|close|search|plus|minus|check)(\b|[\/_\-\s]|$)|用户[-_\s]?\d*)|(^|[\/_.\-\s])icon($|[\/_.\-\s])|图标/i;
@@ -171,6 +192,7 @@ const COMMON_ICON_SIZES = [4, 8, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 40, 44,
 const ICON_SIZE_TOLERANCE = 1;
 const MAX_ICON_DIMENSION = 96;
 
+/** 节点名称 → 语义角色映射规则表 */
 const NAME_PATTERNS: NamePattern[] = [
   { pattern: /^(top.?)?nav(bar|igation)?|header/i, role: "HEADER", html: "header" },
   { pattern: /^footer/i, role: "FOOTER", html: "footer" },
@@ -203,6 +225,7 @@ const NAME_PATTERNS: NamePattern[] = [
 
 const _semanticRoleCache = new WeakMap<FigmaNode, SemanticRole | null>();
 
+/** 推断节点的语义角色（缓存结果，避免重复计算） */
 export function inferSemanticRole(node: FigmaNode): SemanticRole | null {
   if (!node) return null;
   const cached = _semanticRoleCache.get(node);
@@ -213,6 +236,7 @@ export function inferSemanticRole(node: FigmaNode): SemanticRole | null {
   return result;
 }
 
+/** 实际推断逻辑：先匹配名称规则，再按类型/结构推断 */
 function _inferSemanticRoleImpl(node: FigmaNode): SemanticRole | null {
   for (const { pattern, role, html } of NAME_PATTERNS) {
     if (pattern.test(node.name)) {
@@ -243,6 +267,7 @@ function hasImageFill(node: FigmaNode): boolean {
   return (node.fills || []).some((f) => f.type === "IMAGE" && f.visible !== false);
 }
 
+/** 从节点结构推断语义角色（按钮、卡片、header、footer 等） */
 function inferFromStructure(node: FigmaNode): SemanticRole | null {
   const children = node.children || [];
   if (children.length === 0) return null;
@@ -275,6 +300,7 @@ function inferFromStructure(node: FigmaNode): SemanticRole | null {
   return null;
 }
 
+/** 将 Figma 节点递归简化为 SimplifiedNode 树（去除冗余属性，保留关键信息） */
 export function simplifyNode(node: FigmaNode, depth: number = 0, maxDepth: number = 10): SimplifiedNode | null {
   if (depth > maxDepth) return null;
   if (!node) return null;
@@ -430,6 +456,7 @@ export function simplifyNode(node: FigmaNode, depth: number = 0, maxDepth: numbe
   return result;
 }
 
+/** 递归收集文件中所有 COMPONENT 节点，构建 componentId → {name, description} 映射 */
 export function buildComponentMap(node: FigmaNode, map: Record<string, { name: string; description: string | null }> = {}): Record<string, { name: string; description: string | null }> {
   if (node.type === "COMPONENT") {
     map[node.id] = {
@@ -445,6 +472,7 @@ export function buildComponentMap(node: FigmaNode, map: Record<string, { name: s
   return map;
 }
 
+/** 生成节点树的统计摘要（总节点数、类型分布、文本内容、组件实例） */
 export function generateSummary(tree: SimplifiedNode | null): any {
   if (!tree) return null;
 
@@ -462,6 +490,7 @@ export function generateSummary(tree: SimplifiedNode | null): any {
   };
 }
 
+/** 生成 condensed v1 格式文本（带 token 预算参数，实际不截断，仅规范化深度） */
 export function toCondensedWithBudget(
   node: FigmaNode,
   _maxTokens: number = 4000,
@@ -473,6 +502,7 @@ export function toCondensedWithBudget(
   return toCondensedFormat(node, 0, effectiveMaxDepth, variableMap, svgMap);
 }
 
+/** 递归生成 condensed v1 格式：每个节点一行，缩进表示层级 */
 export function toCondensedFormat(
   node: FigmaNode,
   depth: number = 0,
@@ -526,6 +556,7 @@ interface CondensedV2Context {
   svgHrefBase?: string;
 }
 
+/** 生成 condensed v2 格式文本（带 token 预算参数） */
 export function toCondensedV2WithBudget(
   node: FigmaNode,
   _maxTokens: number = 4000,
@@ -537,6 +568,10 @@ export function toCondensedV2WithBudget(
   return toCondensedV2Format(node, 0, effectiveMaxDepth, variableMap, svgMap);
 }
 
+/**
+ * 生成 condensed v2 格式：包含 @format/@assets/@sizes/@colors/@styles/@tree 等段落
+ * 比 v1 更结构化，提取公共样式为引用，减少重复
+ */
 export function toCondensedV2Format(
   node: FigmaNode,
   depth: number = 0,
@@ -592,6 +627,7 @@ export function toCondensedV2Format(
   return lines.join("\n");
 }
 
+/** 生成 semantic JSON 格式：结构化 JSON，含语义角色、变量定义、能力声明 */
 export function toSemanticJson(
   node: FigmaNode,
   options: SemanticTransformOptions = {}
@@ -609,6 +645,7 @@ export function toSemanticJson(
   };
 }
 
+/** 生成 condensed v3 格式文本（最完整版本，含变量定义和能力声明） */
 export function toCondensedV3WithBudget(
   node: FigmaNode,
   _maxTokens: number = 4000,
@@ -624,6 +661,10 @@ export function toCondensedV3WithBudget(
   });
 }
 
+/**
+ * 生成 condensed v3 格式：在 v2 基础上增加 @capabilities/@tokens 段落
+ * 是最完整的文本格式输出
+ */
 export function toCondensedV3Format(
   node: FigmaNode,
   options: SemanticTransformOptions = {}
@@ -664,6 +705,7 @@ function semanticCapabilities(
   };
 }
 
+/** 递归构建 semantic JSON 节点（含语义角色、布局、视觉、文本、组件等信息） */
 function toSemanticNode(
   node: FigmaNode,
   depth: number,
@@ -1600,6 +1642,7 @@ function normalizeMaxDepth(maxDepth: number | undefined, fallback: number): numb
   return Math.max(0, Math.floor(maxDepth!));
 }
 
+/** 将 Figma RGBA 颜色转为 CSS 字符串（hex 或 rgba） */
 export function colorToString(color: FigmaColor | undefined, opacity?: number): string | null {
   if (!color) return null;
   const r = Math.round(color.r * 255);
@@ -1675,6 +1718,7 @@ function collectPaintVariables(
   }
 }
 
+/** 将 Figma 渐变填充转为 CSS gradient 字符串 */
 export function gradientToCSS(fill: FigmaFill): string | null {
   if (!fill || !fill.gradientStops) return null;
 
@@ -1737,6 +1781,7 @@ function calcGradientAngle(positions: FigmaPosition[] | undefined): number {
 
 const _parseEffectsCache = new WeakMap<FigmaEffect[], ParsedEffect[] | null>();
 
+/** 解析 Figma effects 数组为标准化的 ParsedEffect 列表（带缓存） */
 export function parseEffects(effects: FigmaEffect[] | undefined): ParsedEffect[] | null {
   if (!effects || effects.length === 0) return null;
   const cached = _parseEffectsCache.get(effects);
@@ -1771,6 +1816,7 @@ export function parseEffects(effects: FigmaEffect[] | undefined): ParsedEffect[]
   return parsed;
 }
 
+/** 将 effects 转为 CSS 属性（box-shadow、filter、backdrop-filter） */
 export function effectsToCSS(effects: FigmaEffect[] | undefined): Record<string, string> {
   const css: Record<string, string> = {};
   const parsed = parseEffects(effects);
@@ -1795,6 +1841,7 @@ export function effectsToCSS(effects: FigmaEffect[] | undefined): Record<string,
 }
 
 
+/** 将 fills 转为 CSS background 属性（支持多层填充） */
 export function fillsToCSS(fills: FigmaFill[] | undefined): Record<string, string> {
   const css: Record<string, string> = {};
   if (!fills || fills.length === 0) return css;
@@ -1867,6 +1914,7 @@ function averageGap(
 
 const _inferLayoutCache = new WeakMap<FigmaNode, InferredLayout | null>();
 
+/** 从子节点位置推断布局方向（row/col/grid），用于没有 layoutMode 的节点 */
 function inferLayoutFromChildBounds(node: FigmaNode): InferredLayout | null {
   const cached = _inferLayoutCache.get(node);
   if (cached !== undefined) return cached;
@@ -1961,6 +2009,7 @@ function roundNumber(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+/** 从 Figma Variables API 响应构建 variableId → CSS 变量名映射 */
 export function buildVariableMap(variablesData: any): Record<string, string> {
   const map: Record<string, string> = {};
   if (!variablesData || !variablesData.meta || !variablesData.meta.variables) {
@@ -1974,6 +2023,7 @@ export function buildVariableMap(variablesData: any): Record<string, string> {
   return map;
 }
 
+/** 构建语义变量定义：从 Variables API 数据提取完整的 token 信息（含模式值、CSS 变量名） */
 export function buildSemanticVariableDefinitions(variablesData: any): Record<string, SemanticVariableDefinition> {
   const result: Record<string, SemanticVariableDefinition> = {};
   if (!variablesData?.meta?.variables) return result;
@@ -2010,6 +2060,7 @@ export function buildSemanticVariableDefinitions(variablesData: any): Record<str
   return result;
 }
 
+/** 将语义变量定义转为扁平的 variableId → cssVar 映射 */
 export function semanticDefinitionsToVariableMap(
   definitions: Record<string, SemanticVariableDefinition> | null | undefined
 ): CondensedVariableMap | null {
@@ -2040,6 +2091,7 @@ function formatVariableValue(value: any): string {
 }
 
 
+/** 从节点树中的 boundVariables 反向构建变量映射（不依赖 Variables API） */
 export function buildVariableMapFromNodes(node: FigmaNode): Record<string, { color: string; cssVar: string }> {
   const varEntries: Record<string, { color: string; contexts: any[] }> = {};
 
@@ -2098,6 +2150,7 @@ export function buildVariableMapFromNodes(node: FigmaNode): Record<string, { col
 }
 
 
+/** 根据变量使用上下文推断 CSS 变量名前缀（bg/text/border/gradient/effect） */
 function inferVarName(id: string, color: string, context: any): string {
   const idNum = id.replace("VariableID:", "").replace(/:/g, "-");
   const usage = context?.usage || "color";
@@ -2117,6 +2170,7 @@ function inferVarName(id: string, color: string, context: any): string {
   return `--${prefix}-${idNum}`;
 }
 
+/** 从约束条件推断响应式布局提示（stretch-x、fluid-width 等） */
 function inferResponsiveHint(node: FigmaNode): string | null {
   const bbox = node.absoluteBoundingBox;
   const constraints = node.constraints;
@@ -2149,6 +2203,7 @@ function inferResponsiveHint(node: FigmaNode): string | null {
   return hints.length > 0 ? hints.join(", ") : null;
 }
 
+/** 递归遍历简化节点树，收集统计信息 */
 function walkTree(node: SimplifiedNode, stats: { total: number; types: Record<string, number>; texts: any[]; components: any[] }): void {
   stats.total++;
   stats.types[node.type] = (stats.types[node.type] || 0) + 1;
@@ -2167,10 +2222,12 @@ function walkTree(node: SimplifiedNode, stats: { total: number; types: Record<st
   }
 }
 
+/** 粗略估算文本的 token 数（按每 4 字符 ≈ 1 token） */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** 判断节点是否可能是图标（名称匹配 + 容器类型 + 图标尺寸） */
 export function isLikelyIconNode(node: FigmaNode): boolean {
   if (!node) return false;
 
@@ -2204,6 +2261,7 @@ function quoteCondensedPath(value: string): string {
 }
 
 
+/** 生成 condensed v1 单行表示：[TYPE "name" size bg:color ...] */
 function toCondensedLine(
   node: FigmaNode,
   depth: number,

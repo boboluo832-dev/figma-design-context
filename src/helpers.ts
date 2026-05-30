@@ -1,11 +1,24 @@
+/**
+ * 辅助工具函数集合
+ *
+ * 提供以下能力：
+ * - parseFigmaUrl: 从 Figma URL 中解析 fileKey 和 nodeId
+ * - extractAllTexts: 递归提取节点树中所有文本内容
+ * - nodeToCSS / nodeToTailwind: 将节点属性转换为 CSS 或 Tailwind 类名
+ * - searchNodes: 按名称/类型搜索节点
+ * - extractDesignInfo: 提取颜色、字体、组件引用信息
+ */
+
 import { colorToString, gradientToCSS, fillsToCSS, effectsToCSS, parseEffects, inferSemanticRole } from "./transformer.js";
 
+/** 提取的文本条目 */
 export interface ExtractedText {
-  path: string;
-  text: string;
-  style?: string;
+  path: string;   // 节点路径（如 "Page > Frame > Button > Label"）
+  text: string;   // 文本内容
+  style?: string; // 样式摘要（如 "Inter 16px w700"）
 }
 
+/** RGB 颜色转十六进制（Figma 用 0-1 浮点数表示 RGB） */
 function rgbToHex(c: { r: number; g: number; b: number }): string {
   const r = Math.round(c.r * 255);
   const g = Math.round(c.g * 255);
@@ -13,6 +26,11 @@ function rgbToHex(c: { r: number; g: number; b: number }): string {
   return `${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}`;
 }
 
+/**
+ * 解析 Figma URL，提取 fileKey 和 nodeId
+ * 支持 /design/、/file/、/proto/ 三种 URL 格式
+ * nodeId 从 URL 的 ?node-id= 查询参数中获取
+ */
 export function parseFigmaUrl(url: string): { fileKey: string; nodeId?: string } | null {
   try {
     const u = new URL(url);
@@ -26,6 +44,10 @@ export function parseFigmaUrl(url: string): { fileKey: string; nodeId?: string }
   }
 }
 
+/**
+ * 递归提取节点树中所有 TEXT 节点的文字内容
+ * 跳过不可见节点，记录节点路径和文字样式信息
+ */
 export function extractAllTexts(node: any, maxDepth: number = 20, path: string = "", depth: number = 0): ExtractedText[] {
   if (!node || depth > maxDepth) return [];
   if (node.visible === false) return [];
@@ -55,6 +77,7 @@ export function extractAllTexts(node: any, maxDepth: number = 20, path: string =
   return results;
 }
 
+/** 将变量的多模式值格式化为可读形式 */
 export function formatVariableValues(valuesByMode: Record<string, any>, modes: any[]): Record<string, any> {
   const result: Record<string, any> = {};
   for (const mode of modes) {
@@ -64,6 +87,7 @@ export function formatVariableValues(valuesByMode: Record<string, any>, modes: a
   return result;
 }
 
+/** 将单个变量值格式化为字符串（颜色、数字、别名等） */
 export function formatValue(value: any): string {
   if (!value) return "null";
   if (typeof value === "number" || typeof value === "string" || typeof value === "boolean") return String(value);
@@ -76,6 +100,10 @@ export function formatValue(value: any): string {
   return JSON.stringify(value);
 }
 
+/**
+ * 递归提取节点树中的设计信息：颜色、字体、组件引用
+ * 用于 get_page_for_codegen 工具的设计规范汇总
+ */
 export function extractDesignInfo(node: any, colors: Set<string>, fonts: Set<string>, components: { name: string; componentId: string }[]): void {
   if (!node) return;
 
@@ -104,6 +132,7 @@ export function extractDesignInfo(node: any, colors: Set<string>, fonts: Set<str
   }
 }
 
+/** 将节点名称转为合法的 CSS 类名（小写 + 连字符） */
 export function toCSSClass(name: string): string {
   return name
     .toLowerCase()
@@ -111,6 +140,7 @@ export function toCSSClass(name: string): string {
     .replace(/^-|-$/g, "") || "element";
 }
 
+/** 将单个节点的视觉属性转换为 CSS 声明（尺寸、填充、边框、圆角等） */
 export function nodeToCSS(node: any): string {
   const lines: string[] = [];
   const bbox = node.absoluteBoundingBox;
@@ -197,6 +227,7 @@ export function nodeToCSSRecursive(node: any, depth: number = 0, maxDepth: numbe
   return output;
 }
 
+/** 将单个节点的视觉属性转换为 Tailwind CSS 类名 */
 export function nodeToTailwind(node: any): string {
   const classes: string[] = [];
   const bbox = node.absoluteBoundingBox;
@@ -284,13 +315,18 @@ export function nodeToTailwind(node: any): string {
   return classes.join(" ");
 }
 
+/** 搜索结果条目 */
 export interface SearchResult {
   id: string;
   name: string;
   type: string;
-  path: string;
+  path: string; // 节点在树中的完整路径
 }
 
+/**
+ * 递归搜索节点树，按名称（模糊匹配）和类型过滤
+ * 达到 maxResults 后提前终止，避免大文件搜索过慢
+ */
 export function searchNodes(
   node: any,
   options: { query?: string; type?: string; maxResults?: number },
@@ -318,6 +354,11 @@ export function searchNodes(
   return results;
 }
 
+/**
+ * 递归生成 Tailwind HTML 模板
+ * 结合语义角色推断选择 HTML 标签（button/nav/header 等）
+ * 输出缩进的 JSX 风格代码，可直接用于 React 组件
+ */
 export function nodeToTailwindRecursive(node: any, depth: number = 0, maxDepth: number = 8): string {
   if (!node || depth > maxDepth) return "";
   if (node.visible === false) return "";

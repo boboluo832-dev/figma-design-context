@@ -1,3 +1,14 @@
+/**
+ * MCP 工具共享工具函数
+ *
+ * 提供 14 个工具 handler 的公共逻辑：
+ * - textResponse: 统一 MCP 响应格式
+ * - normalizeNodeId: 节点 ID 格式规范化（dash → colon）
+ * - formatError: 错误信息中文化 + 分类处理
+ * - fetchNodeDocument: 获取单个节点文档的通用流程
+ * - exportAndRegisterIcons: SVG 导出 + 图标索引注册
+ */
+
 import { FigmaClient, FigmaApiError } from "../figma-client.js";
 import type { FigmaNodesResponse, FigmaNode } from "../figma-client.js";
 import { TempManager } from "../temp-manager.js";
@@ -5,16 +16,30 @@ import type { IconEntry } from "../temp-manager.js";
 import { SvgExporter } from "../svg-exporter.js";
 import type { CondensedSvgMap } from "../transformer.js";
 
+/** MCP 工具的标准响应类型 */
 export type McpToolResponse = { content: Array<{ type: "text"; text: string }> };
 
+/** 将文本包装为 MCP 标准响应格式 */
 export function textResponse(text: string): McpToolResponse {
   return { content: [{ type: "text" as const, text }] };
 }
 
+/**
+ * 规范化节点 ID：将 URL 中的 dash 格式（1-2）转为 Figma API 要求的 colon 格式（1:2）
+ * Figma URL 中用 dash 是因为 colon 在 URL 中是特殊字符
+ */
 export function normalizeNodeId(id: string): string {
   return id.replace(/-/g, ":");
 }
 
+/**
+ * 统一错误处理：将各种错误转为中文友好的 MCP 响应
+ * - 401/403 → token 无效提示
+ * - 404 → 文件/节点不存在
+ * - 429 → 限流提示
+ * - 5xx → 服务端错误
+ * - 网络错误 → 连接失败提示
+ */
 export function formatError(error: unknown): McpToolResponse {
   if (error instanceof FigmaApiError) {
     const status = error.status;
@@ -43,6 +68,11 @@ export function formatError(error: unknown): McpToolResponse {
   return textResponse("发生未知错误");
 }
 
+/**
+ * 获取单个节点的文档数据
+ * 统一处理 ID 规范化、API 调用、空值检查
+ * 返回值是联合类型：成功返回 document，失败返回 McpToolResponse（错误信息）
+ */
 export async function fetchNodeDocument(
   figma: FigmaClient,
   fileKey: string,
@@ -57,10 +87,15 @@ export async function fetchNodeDocument(
   return { document: nodeData.document, raw: nodeData };
 }
 
+/** 类型守卫：判断返回值是否为错误响应（用于 fetchNodeDocument 的结果判断） */
 export function isErrorResponse(result: any): result is McpToolResponse {
   return result && "content" in result && Array.isArray(result.content);
 }
 
+/**
+ * 导出节点中的可导出图标并注册到 icons index
+ * 流程：检测可导出节点 → 调用 Figma Images API 获取 SVG URL → 下载保存 → 注册索引
+ */
 export async function exportAndRegisterIcons(
   svgExporter: SvgExporter,
   tempManager: TempManager,

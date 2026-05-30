@@ -1,19 +1,41 @@
+/**
+ * 节点差异对比模块
+ *
+ * 提供两个节点树之间的结构化差异分析：
+ * - 属性变更（颜色、尺寸、文本等）
+ * - 子节点新增/删除
+ * - 递归深度控制
+ *
+ * 用于 diff_nodes 工具，支持版本对比和跨节点对比
+ */
+
+/** 差异条目类型 */
 export interface DiffEntry {
   type: "changed" | "added" | "removed" | "unchanged";
-  path: string;
+  path: string;       // 节点在树中的路径
   nodeType: string;
   nodeName: string;
   nodeId?: string;
-  changes?: Array<{ prop: string; from: string; to: string }>;
-  childrenCount?: number;
+  changes?: Array<{ prop: string; from: string; to: string }>; // 具体属性变更
+  childrenCount?: number; // 未展开的子节点数量（深度截断时）
 }
 
+/**
+ * 对比两个节点树的差异（入口函数）
+ * @param nodeA - 基准节点（旧版本）
+ * @param nodeB - 目标节点（新版本）
+ * @param depth - 递归深度限制
+ */
 export function diffNodes(nodeA: any, nodeB: any, depth: number = 3, path: string = ""): DiffEntry[] {
   const results: DiffEntry[] = [];
   diffRecursive(nodeA, nodeB, depth, path, 0, results);
   return results;
 }
 
+/**
+ * 递归对比两个节点树
+ * 通过 ID 匹配子节点：ID 相同的递归对比，A 有 B 没有的标记为 removed，B 有 A 没有的标记为 added
+ */
 function diffRecursive(a: any, b: any, maxDepth: number, path: string, depth: number, results: DiffEntry[]): void {
   if (!a || !b) return;
 
@@ -85,6 +107,10 @@ function diffRecursive(a: any, b: any, maxDepth: number, path: string, depth: nu
   }
 }
 
+/**
+ * 对比两个节点的关键属性差异
+ * 检查：名称、类型、可见性、尺寸、位置、文本内容、字体、透明度、圆角、布局、填充、描边
+ */
 function compareProperties(a: any, b: any): Array<{ prop: string; from: string; to: string }> {
   const changes: Array<{ prop: string; from: string; to: string }> = [];
 
@@ -140,12 +166,14 @@ function compareProperties(a: any, b: any): Array<{ prop: string; from: string; 
   return changes;
 }
 
+/** 单属性对比辅助函数 */
 function compareProp(changes: Array<{ prop: string; from: string; to: string }>, prop: string, a: any, b: any): void {
   if (a === b) return;
   if (a === undefined && b === undefined) return;
   changes.push({ prop, from: String(a ?? ""), to: String(b ?? "") });
 }
 
+/** 将填充数组摘要为可读字符串（用于 diff 输出） */
 function summarizeFills(fills: any[]): string {
   if (!fills || fills.length === 0) return "none";
   const visible = fills.filter((f) => f.visible !== false);
@@ -159,6 +187,7 @@ function summarizeFills(fills: any[]): string {
   }).join(", ");
 }
 
+/** 将差异条目格式化为人类可读的文本输出 */
 export function formatDiffOutput(entries: DiffEntry[]): string {
   if (entries.length === 0) return "无差异，两个节点完全相同";
 

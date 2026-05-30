@@ -1,3 +1,20 @@
+/**
+ * 临时文件管理器
+ *
+ * 管理 .figma-temp 目录下的所有调试/缓存文件：
+ * - logs/       调试日志（raw + optimized）
+ * - svg/        导出的 SVG 图标文件
+ * - raw/        Figma API 原始响应 JSON
+ * - optimized/  转换后的优化数据
+ * - condensed/  condensed 格式输出（v1/v2/v3）
+ * - icons/      图标索引（index.json）
+ *
+ * 特性：
+ * - debugMode=false 时大部分写入操作为 no-op（不写文件）
+ * - 支持通过环境变量 FIGMA_TEMP_DIR 自定义目录位置
+ * - init() 会清空重建整个目录（用于 debug server 的 reset）
+ */
+
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,12 +23,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MODULE_ROOT = __dirname;
 const DEFAULT_TEMP_DIR = ".figma-temp";
 
+/** 图标索引条目 */
 export interface IconEntry {
   fileKey: string;
   nodeId: string;
   name: string;
   svgPath: string | null;
-  source: string;
+  source: string;        // 来源标识（如 "debug_web", "mcp_tool"）
   createdAt?: string;
   updatedAt?: string;
 }
@@ -20,6 +38,7 @@ interface IconsIndex {
   icons: IconEntry[];
 }
 
+/** 判断是否开启 debug 模式（环境变量 FIGMA_DEBUG=1/true/yes/on） */
 export function isFigmaDebugEnabled(value: string | undefined = process.env.FIGMA_DEBUG): boolean {
   if (!value) return false;
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
@@ -55,6 +74,7 @@ export class TempManager {
     this.debugMode = debugMode;
   }
 
+  /** 清空并重建整个临时目录 */
   init(): void {
     if (fs.existsSync(this.tempDir)) {
       fs.rmSync(this.tempDir, { recursive: true, force: true });
@@ -62,6 +82,7 @@ export class TempManager {
     this.ensure();
   }
 
+  /** 确保所有子目录存在（幂等操作） */
   ensure(): void {
     fs.mkdirSync(this.logsDir, { recursive: true });
     fs.mkdirSync(this.svgDir, { recursive: true });
@@ -76,6 +97,7 @@ export class TempManager {
     }
   }
 
+  /** 保存 SVG 文件到 svg/ 目录（始终写入，不受 debugMode 控制） */
   writeSvg(filename: string, content: string): string {
     this.ensure();
     const filePath = path.join(this.svgDir, filename);
@@ -83,14 +105,17 @@ export class TempManager {
     return filePath;
   }
 
+  /** 写入原始 API 响应 JSON */
   writeRaw(fileKey: string, nodeId: string, data: unknown): string | null {
     return this._writeJson(this.rawDir, fileKey, nodeId, data);
   }
 
+  /** 写入优化后的数据 JSON */
   writeOptimized(fileKey: string, nodeId: string, data: unknown): string | null {
     return this._writeJson(this.optimizedDir, fileKey, nodeId, data);
   }
 
+  /** 写入 condensed v1 格式文本 */
   writeCondensed(fileKey: string, nodeId: string, content: string): string | null {
     this.ensure();
     const safeNodeId = nodeId.replace(/:/g, "-");
@@ -99,6 +124,7 @@ export class TempManager {
     return filePath;
   }
 
+  /** 写入 condensed v2 格式文本 */
   writeCondensedV2(fileKey: string, nodeId: string, content: string): string | null {
     this.ensure();
     const safeNodeId = nodeId.replace(/:/g, "-");
@@ -107,6 +133,7 @@ export class TempManager {
     return filePath;
   }
 
+  /** 写入 condensed v3 格式文本 */
   writeCondensedV3(fileKey: string, nodeId: string, content: string): string | null {
     this.ensure();
     const safeNodeId = nodeId.replace(/:/g, "-");
@@ -115,6 +142,7 @@ export class TempManager {
     return filePath;
   }
 
+  /** 内部：写入 JSON 文件到指定目录 */
   private _writeJson(dir: string, fileKey: string, nodeId: string, data: unknown): string {
     this.ensure();
     const safeNodeId = nodeId.replace(/:/g, "-");
@@ -123,10 +151,12 @@ export class TempManager {
     return filePath;
   }
 
+  /** 添加单个图标到索引 */
   addIcon(entry: IconEntry): void {
     this.addIcons([entry]);
   }
 
+  /** 批量添加图标到索引（已存在的按 fileKey:nodeId 去重更新） */
   addIcons(entries: IconEntry[]): void {
     this.ensure();
     const index = this._readIconsIndex();
@@ -147,11 +177,13 @@ export class TempManager {
     fs.writeFileSync(this.iconsIndexPath, JSON.stringify(index, null, 2), "utf-8");
   }
 
+  /** 获取当前图标索引 */
   getIconsIndex(): IconsIndex {
     this.ensure();
     return this._readIconsIndex();
   }
 
+  /** 内部：读取图标索引文件，解析失败返回空列表 */
   private _readIconsIndex(): IconsIndex {
     try {
       const content = fs.readFileSync(this.iconsIndexPath, "utf-8");
@@ -161,6 +193,7 @@ export class TempManager {
     }
   }
 
+  /** 写入调试日志（仅 debugMode=true 时生效），返回文件路径或 null */
   writeLog(toolName: string, type: string, data: unknown): string | null {
     if (!this.debugMode) return null;
     this.ensure();

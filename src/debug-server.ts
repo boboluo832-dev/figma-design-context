@@ -1,3 +1,24 @@
+/**
+ * Debug Web Server — 本地调试用 HTTP 服务
+ *
+ * 提供一个 Web UI 用于可视化调试 Figma 数据转换流程：
+ * - 输入 Figma URL/Token → 查看 raw/optimized/condensed 各格式输出
+ * - 预览检测到的图标并导出 SVG
+ * - 下载所有图标为 ZIP 包
+ *
+ * 路由：
+ * - GET  /                    → 调试页面 HTML
+ * - GET  /api/health          → 健康检查
+ * - GET  /api/icons           → 已导出图标索引
+ * - GET  /api/icons.zip       → 打包下载所有 SVG
+ * - POST /api/inspect         → 核心：获取并转换 Figma 节点数据
+ * - POST /api/export-icons    → 导出指定图标为 SVG
+ * - POST /api/reset           → 清空临时文件
+ * - GET  /debug-assets/svg/*  → 静态 SVG 文件服务
+ *
+ * 启动方式：npx tsx src/debug-server.ts（默认端口 3333，自动递增寻找可用端口）
+ */
+
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -23,15 +44,17 @@ import { SvgExporter } from "./svg-exporter.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, "..");
-const WEB_ROOT = path.join(PROJECT_ROOT, "debug-web");
+const WEB_ROOT = path.join(PROJECT_ROOT, "debug-web"); // 静态 HTML 页面目录
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = parseInt(process.env.DEBUG_WEB_PORT || "3333", 10);
-const MAX_BODY_SIZE = 1024 * 1024;
-const PREVIEW_CHAR_LIMIT = 120_000;
+const MAX_BODY_SIZE = 1024 * 1024;       // 请求体最大 1MB
+const PREVIEW_CHAR_LIMIT = 120_000;      // JSON 预览截断阈值
 
+// debug server 使用独立的 TempManager 实例（始终开启 debug 模式）
 const tempManager = new TempManager(undefined, true, process.env.FIGMA_TEMP_DIR);
 tempManager.ensure();
 
+/** /api/inspect 请求体 */
 interface InspectRequest {
   token?: string;
   url?: string;
@@ -42,6 +65,7 @@ interface InspectRequest {
   exportIcons?: boolean;
 }
 
+/** /api/export-icons 请求体 */
 interface ExportIconsRequest {
   token?: string;
   fileKey?: string;
@@ -58,6 +82,7 @@ function normalizeNodeId(nodeId: string | undefined): string | undefined {
   return decodeURIComponent(nodeId.trim()).replace(/-/g, ":");
 }
 
+/** 从 URL 或 fileKey+nodeId 解析出目标 */
 export function resolveTarget(input: InspectRequest): ResolvedTarget {
   const fromUrl = input.url ? parseFigmaUrl(input.url.trim()) : null;
   const fileKey = (input.fileKey || fromUrl?.fileKey || "").trim();
@@ -70,6 +95,7 @@ export function resolveTarget(input: InspectRequest): ResolvedTarget {
   return { fileKey, nodeId };
 }
 
+/** 读取 HTTP 请求体（限制最大 1MB，防止内存溢出） */
 function getRequestBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -85,6 +111,7 @@ function getRequestBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
+/** JSON 响应辅助 */
 function sendJson(res: http.ServerResponse, status: number, data: unknown): void {
   const payload = JSON.stringify(data);
   res.writeHead(status, {
@@ -110,6 +137,7 @@ function sendBinary(res: http.ServerResponse, status: number, data: Buffer, head
   res.end(data);
 }
 
+/** 将错误转为统一的 JSON 响应格式 */
 export function errorPayload(error: unknown): { message: string; status?: number } {
   if (error instanceof FigmaApiError) {
     return { message: error.message, status: error.status };
@@ -120,6 +148,7 @@ export function errorPayload(error: unknown): { message: string; status?: number
   return { message: String(error) };
 }
 
+/** JSON 预览截断：超过字符限制时截断并提示完整数据已保存到磁盘 */
 function stringifyPreview(data: unknown, limit: number = PREVIEW_CHAR_LIMIT): { text: string; truncated: boolean; bytes: number } {
   const text = JSON.stringify(data, null, 2);
   const truncated = text.length > limit;
@@ -130,6 +159,7 @@ function stringifyPreview(data: unknown, limit: number = PREVIEW_CHAR_LIMIT): { 
   };
 }
 
+/** 获取已导出图标的索引信息，附加 Web 访问路径 */
 function iconIndexPayload(): unknown {
   const index = tempManager.getIconsIndex();
   const exported = index.icons
@@ -147,6 +177,7 @@ function iconIndexPayload(): unknown {
   return { ...index, exported };
 }
 
+/** 加载文件的语义变量定义（用于 condensed-v3 格式），失败时优雅降级 */
 async function loadSemanticVariables(figma: FigmaClient, fileKey: string): Promise<{
   definitions: ReturnType<typeof buildSemanticVariableDefinitions> | null;
   variableMap: CondensedVariableMap | null;
@@ -177,6 +208,7 @@ async function loadSemanticVariables(figma: FigmaClient, fileKey: string): Promi
   }
 }
 
+/** CRC32 校验和计算（用于 ZIP 文件格式） */
 export function crc32(buffer: Buffer): number {
   let crc = 0xffffffff;
   for (const byte of buffer) {
@@ -188,6 +220,7 @@ export function crc32(buffer: Buffer): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
+/** 将 Date 转为 ZIP 文件格式的 MS-DOS 时间/日期字段 */
 export function zipDateTime(date: Date): { time: number; date: number } {
   const year = Math.max(date.getFullYear(), 1980);
   return {
@@ -196,6 +229,10 @@ export function zipDateTime(date: Date): { time: number; date: number } {
   };
 }
 
+/**
+ * 纯 JS 实现的 ZIP 打包（无外部依赖）
+ * 使用 STORE 方式（不压缩），适合小文件 SVG 打包
+ */
 export function makeZip(files: Array<{ filename: string; content: Buffer; modifiedAt: Date }>): Buffer {
   const localParts: Buffer[] = [];
   const centralParts: Buffer[] = [];
@@ -258,6 +295,7 @@ export function makeZip(files: Array<{ filename: string; content: Buffer; modifi
   return Buffer.concat([...localParts, centralDirectory, end]);
 }
 
+/** 将所有已导出的 SVG 打包为 ZIP 文件 */
 async function buildIconsZip(): Promise<Buffer> {
   const index = tempManager.getIconsIndex();
   const files: Array<{ filename: string; content: Buffer; modifiedAt: Date }> = [];
@@ -287,6 +325,11 @@ async function buildIconsZip(): Promise<Buffer> {
   return makeZip(files);
 }
 
+/**
+ * 核心 inspect 逻辑：获取 Figma 数据并生成多种格式的转换结果
+ * 返回 raw / simplified / condensed / condensed-v2 / condensed-v3 / semantic 六种格式
+ * 同时检测并导出图标
+ */
 async function inspectFigma(input: InspectRequest): Promise<unknown> {
   const token = (input.token || process.env.FIGMA_TOKEN || "").trim();
   if (!token) {
@@ -410,6 +453,7 @@ async function inspectFigma(input: InspectRequest): Promise<unknown> {
   };
 }
 
+/** 导出检测到的图标节点为 SVG 文件 */
 async function exportDetectedIcons(input: ExportIconsRequest): Promise<unknown> {
   const token = (input.token || process.env.FIGMA_TOKEN || "").trim();
   if (!token) {
@@ -471,6 +515,7 @@ async function exportDetectedIcons(input: ExportIconsRequest): Promise<unknown> 
   return { exported, missing, index: iconIndexPayload() };
 }
 
+/** 提供单个 SVG 文件的静态服务 */
 async function serveSvg(filename: string, res: http.ServerResponse): Promise<void> {
   const safeName = path.basename(filename);
   const filePath = path.join(tempManager.svgDir, safeName);
@@ -482,6 +527,7 @@ async function serveSvg(filename: string, res: http.ServerResponse): Promise<voi
   }
 }
 
+/** 提供调试页面 HTML */
 async function serveIndex(res: http.ServerResponse): Promise<void> {
   try {
     const html = await fs.readFile(path.join(WEB_ROOT, "index.html"), "utf-8");
@@ -491,6 +537,7 @@ async function serveIndex(res: http.ServerResponse): Promise<void> {
   }
 }
 
+/** HTTP 请求路由分发 */
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const requestUrl = new URL(req.url || "/", `http://${HOST}`);
 
@@ -571,6 +618,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
   sendJson(res, 404, { error: "Not found" });
 }
 
+/** 在指定端口启动 HTTP 服务，返回 server 实例 */
 function listenOnPort(port: number): Promise<http.Server> {
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch((error) => {
@@ -587,6 +635,7 @@ function listenOnPort(port: number): Promise<http.Server> {
   });
 }
 
+/** 启动服务：从 DEFAULT_PORT 开始尝试，端口被占用则递增（最多尝试 20 个） */
 async function start(): Promise<void> {
   for (let port = DEFAULT_PORT; port < DEFAULT_PORT + 20; port++) {
     try {
@@ -602,6 +651,7 @@ async function start(): Promise<void> {
   throw new Error(`没有可用端口: ${DEFAULT_PORT}-${DEFAULT_PORT + 19}`);
 }
 
+/** 判断当前文件是否作为主模块直接运行（而非被 import） */
 function isMainModule(): boolean {
   if (process.argv.length < 2) return false;
   const entry = process.argv[1];
